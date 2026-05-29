@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: air-threat-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: PORT
+        value: "10000"
+      - key: TZ
+        value: "Europe/Kyiv"
+      - key: WEBHOOK_SECRET_PATH
+        value: "/tg/webhook"
+      # Set the rest manually in Render dashboard:
+      # BOT_TOKEN, ADMIN_IDS, CHANNELS, CHANNEL_LABELS,
+      # DATABASE_URL (Supabase Postgres), WEBHOOK_BASE_URL,
+      # POLL_INTERVAL_IDLE, POLL_INTERVAL_ACTIVE, ALERT_MIN_LEVEL, ALERT_COOLDOWN_SEC
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: CHANNELS
+        sync: false
+      - key: CHANNEL_LABELS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: WEBHOOK_BASE_URL
+        sync: false
+      - key: POLL_INTERVAL_IDLE
+        sync: false
+      - key: POLL_INTERVAL_ACTIVE
+        sync: false
+      - key: ALERT_MIN_LEVEL
+        sync: false
+      - key: ALERT_COOLDOWN_SEC
+        sync: false
