@@ -42,11 +42,14 @@ from aiogram.utils.markdown import hbold, hcode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
+from analytics import compute_attack_stats, detect_incidents
 from classifier import LEVEL_NAMES, TAG_LABELS, classify
 from config import Settings, load_settings
 from db import DB
+from forecast import forecast_24h, render_forecast_text
 from parser import ParsedMessage
 from poller import CLASSIFY_WINDOW_MINUTES, run_poller_loop
+from scheduler import build_digest, run_digest_scheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +66,7 @@ bot = Bot(
 )
 
 POLLER_TASK: asyncio.Task | None = None
+DIGEST_TASK: asyncio.Task | None = None
 
 
 # ---------- latency-logging middleware ----------
@@ -104,6 +108,7 @@ async def cb_latency_log_middleware(handler, event: CallbackQuery, data: dict):
 # Commands shown in the Telegram UI menu (set on startup via setMyCommands).
 BOT_COMMANDS: list[tuple[str, str]] = [
     ("status", "Поточний рівень загрози"),
+    ("forecast", "Прогноз на 24 години"),
     ("history", "Таймлайн за N годин (за замовч. 6)"),
     ("channels", "Список джерел"),
     ("subscribe", "Підписатися на DM-сповіщення"),
@@ -379,6 +384,36 @@ async def _format_history(rows, hours: int) -> str:
     return "\n".join(lines)
 
 
+@dp.message(Command("forecast"))
+async def cmd_forecast(message: Message) -> None:
+    """On-demand 24h probability forecast."""
+    if not in_dm(message):
+        return
+    rows = await asyncio.to_thread(db.recent_messages, 7 * 24 * 60)  # 7d window
+    pms = [ParsedMessage(channel=r.channel, msg_id=r.msg_id, ts=r.ts, text=r.text) for r in rows]
+    for pm, r in zip(pms, rows):
+        pm.tags = set(r.tags)
+    state = await get_state_async()
+    incidents = await asyncio.to_thread(detect_incidents, pms)
+    stats = await asyncio.to_thread(compute_attack_stats, incidents)
+    fcast = await asyncio.to_thread(forecast_24h, state, stats, incidents)
+    text = render_forecast_text(fcast, stats)
+    text += (
+        f"\n\n<i>Поточний стан: {state.short_summary()}</i>\n"
+        f"<i>Інциденти за 7 днів: {len(incidents)}</i>"
+    )
+    await message.answer(text, reply_markup=main_keyboard(), disable_web_page_preview=True)
+
+
+@dp.message(Command("digest"))
+async def cmd_digest(message: Message) -> None:
+    """Admin-only: preview the daily 9:00 digest right now."""
+    if not in_dm(message) or not is_admin(message.from_user.id):
+        return
+    text = await asyncio.to_thread(build_digest, db, settings)
+    await message.answer(text, disable_web_page_preview=True)
+
+
 @dp.message(Command("channels"))
 async def cmd_channels(message: Message) -> None:
     if not in_dm(message):
@@ -571,15 +606,20 @@ async def on_startup(_: web.Application) -> None:
     POLLER_TASK = asyncio.create_task(run_poller_loop(bot, db, settings), name="threat-poller")
     log.info("Poller task scheduled")
 
+    global DIGEST_TASK
+    DIGEST_TASK = asyncio.create_task(run_digest_scheduler(bot, db, settings), name="digest-scheduler")
+    log.info("Daily digest scheduler scheduled (09:00 %s)", settings.tz)
+
 
 async def on_shutdown(_: web.Application) -> None:
-    global POLLER_TASK
-    if POLLER_TASK and not POLLER_TASK.done():
-        POLLER_TASK.cancel()
-        try:
-            await POLLER_TASK
-        except asyncio.CancelledError:
-            pass
+    global POLLER_TASK, DIGEST_TASK
+    for task in (POLLER_TASK, DIGEST_TASK):
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     try:
         await bot.session.close()
     finally:

@@ -56,6 +56,14 @@ TAG_TTL_SEC: dict[str, int] = {
     "kyiv_alarm_shahed": 90 * 60,
     "country_wide_missile_alert": 60 * 60,
     "situation_brief": 60 * 60,
+    # New analytic-tier tags
+    "official_warning_attack": 12 * 60 * 60,       # 12h — warning typically issued same-day
+    "presidential_statement_attack": 24 * 60 * 60, # 24h — single per-day signal
+    "tu95_carrier_movement": 8 * 60 * 60,          # 8h — preparation cycle for bomber raid
+    "naval_carrier_movement": 12 * 60 * 60,        # 12h — Kalibr carriers leave port hours before launch
+    "iskander_launch": 30 * 60,                    # 30min — flight time is short
+    "kab_kyiv": 30 * 60,
+    "shahed_launch_detected": 4 * 60 * 60,         # 4h — Shahed flight time to Kyiv
 }
 
 # Friendly Ukrainian labels for active flags (for /status and DM summaries)
@@ -82,6 +90,14 @@ TAG_LABELS: dict[str, str] = {
     "kyiv_alarm_shahed": "Тривога Київ: Шахеди",
     "country_wide_missile_alert": "Ракетна небезпека по всій країні",
     "situation_brief": "Обстановочний брифінг",
+    # New analytic-tier
+    "official_warning_attack": "📢 Офіційне попередження про атаку",
+    "presidential_statement_attack": "🎙 Заява керівництва про удари",
+    "tu95_carrier_movement": "✈️ Підготовка Ту-95/160 на аеродромі",
+    "naval_carrier_movement": "🚢 Ракетоносії виведені у море",
+    "iskander_launch": "🚀 Пуск Іскандера",
+    "kab_kyiv": "🎯 КАБи в Київщині",
+    "shahed_launch_detected": "🛵 Пуски Шахедів зафіксовано",
 }
 
 LEVEL_NAMES = {
@@ -105,6 +121,12 @@ class ThreatState:
     summary: str
     computed_at: datetime
     last_kyiv_alarm_text: str | None = None
+    # NEW: which preparation-tier flags are currently active. The poller uses
+    # this to push a "preparation" alert only once per appearance of a given
+    # flag (transition off → on), not on every poll iteration.
+    active_preparation_tags: frozenset[str] = frozenset()
+    # Latest message text from key channels for context in alert summary
+    latest_official_msg: str | None = None
 
     def short_summary(self) -> str:
         return f"{self.level_name} (рівень {self.level}/5)"
@@ -183,8 +205,10 @@ def compute_active_flags(
 # wave is treated as Kyiv-relevant even before vector data, because Kyiv is
 # the most likely target on any heavy night.
 KYIV_RELEVANT_TAGS = {
+    # Impact tier
     "explosions_kyiv",
     "ballistic_descent_kyiv",
+    # Direct-on-Kyiv tier
     "kyiv_alarm_ballistic",
     "kyiv_alarm_shahed",
     "kyiv_alarm_active",
@@ -192,12 +216,33 @@ KYIV_RELEVANT_TAGS = {
     "ballistic_threat_from_north",  # Bryansk/Voronezh trajectory → Kyiv corridor
     "shahed_kyiv",
     "shahed_mass",
-    # Strategic-aviation flags are preparatory and contribute up to L2.
-    # They are not Kyiv-targeted by themselves, but they precede combined attacks.
+    "kab_kyiv",
+    "iskander_launch",
+    # Preparation tier (NEW) — bot signals these explicitly as L2
     "mig31_takeoff",
     "tu95_takeoff",
+    "tu95_carrier_movement",
+    "naval_carrier_movement",
     "ru_strategic_aviation_active",
+    "shahed_launch_detected",
+    "official_warning_attack",
+    "presidential_statement_attack",
     "country_wide_missile_alert",
+}
+
+
+# Strong preparation signals. Their presence puts us into the new "Preparation"
+# tier (level 2) even if no concrete Kyiv-targeted activity is happening yet.
+# This is the "stockpile being moved" / "officials warning publicly" stage.
+PREPARATION_TAGS = {
+    "mig31_takeoff",
+    "tu95_takeoff",
+    "tu95_carrier_movement",
+    "naval_carrier_movement",
+    "ru_strategic_aviation_active",
+    "shahed_launch_detected",
+    "official_warning_attack",
+    "presidential_statement_attack",
 }
 
 
@@ -210,15 +255,22 @@ def is_combined_attack(active: dict[str, datetime]) -> tuple[bool, list[str]]:
     strategic_aviation_up = any(
         t in active for t in ("mig31_takeoff", "tu95_takeoff", "ru_strategic_aviation_active")
     )
+    naval_or_official_prep = any(
+        t in active for t in ("naval_carrier_movement", "official_warning_attack")
+    )
 
     indicators: list[tuple[bool, str]] = [
         (strategic_aviation_up, "Стратегічна авіація РФ у повітрі"),
+        (naval_or_official_prep, "Ракетоносії в морі / офіційне попередження"),
         ("shahed_kyiv" in active, "БпЛА курсом на Київ"),
         ("kyiv_alarm_shahed" in active, "Тривога Київ: Шахеди"),
         ("shahed_mass" in active, "Масована атака БпЛА"),
         ("cruise_missile_kyiv" in active, "Крилаті ракети на Київ"),
         ("ballistic_threat_from_north" in active, "Балістика з півночі (Брянськ/Воронеж) на Київ"),
         ("kyiv_alarm_ballistic" in active, "Тривога Київ: Балістика"),
+        ("kab_kyiv" in active, "КАБи у Київщині"),
+        ("iskander_launch" in active, "Пуск Іскандера зафіксовано"),
+        ("shahed_launch_detected" in active, "Зафіксовано пуски Шахедів"),
     ]
     hits = [label for present, label in indicators if present]
     return len(hits) >= 2, hits
@@ -230,14 +282,18 @@ def compute_level(
 ) -> tuple[int, list[str]]:
     """Return (level, trigger_tags).
 
-    Rules are intentionally Kyiv-centric:
-      - Threats over other oblasts do not raise our level by themselves.
-      - Strategic-aviation takeoff alone is at most L2 (preparation, not impact).
-      - L3+ requires a Kyiv-direction signal (alarm in Kyiv, BpLA/missiles on
-        Kyiv, ballistic from northern launch zones whose trajectory IS Kyiv).
-      - L4+ requires a confirmed-imminent strike on Kyiv (Kyiv ballistic alarm,
-        OR ≥2 critical Kyiv-targeted signals, OR a message-density spike).
-      - L5 = impact (explosions / descent over Kyiv).
+    Six-level Kyiv-centric scale:
+      0 — Quiet
+      1 — Background (irrelevant noise from other oblasts)
+      2 — PREPARATION: strategic posturing / official warning / aviation up
+      3 — Active threat (Kyiv-direction signals)
+      4 — Imminent (Kyiv ballistic alarm OR ≥2 critical Kyiv signals)
+      5 — Impact (explosions / descent over Kyiv)
+
+    L2 is intentionally a separate tier ("Preparation"). It is the
+    "stockpile being moved / officials warning publicly" stage. A push to
+    the admin happens once per event so that the user is forewarned
+    BEFORE the public-facing alarm.
     """
     triggers: list[str] = []
 
@@ -251,6 +307,8 @@ def compute_level(
         "kyiv_alarm_ballistic",
         "cruise_missile_kyiv",
         "ballistic_threat_from_north",
+        "kab_kyiv",
+        "iskander_launch",
     ]
     crit_hits = [t for t in crit_signals if t in active]
 
@@ -278,16 +336,13 @@ def compute_level(
             triggers.append(f"msg_density_10min={msg_density_10min}")
         return 3, triggers
 
-    # Level 2: strategic posturing / countrywide preparation (NOT Kyiv-specific yet)
-    mod_signals = [
-        "mig31_takeoff",
-        "tu95_takeoff",
-        "ru_strategic_aviation_active",
-        "country_wide_missile_alert",
-    ]
-    mod_hits = [t for t in mod_signals if t in active]
-    if mod_hits or msg_density_10min >= 3:
-        triggers.extend(mod_hits)
+    # Level 2: PREPARATION — strategic posturing / countrywide preparation /
+    # official warning. Bot pushes a separate "preparation" alert here.
+    prep_hits = [t for t in PREPARATION_TAGS if t in active]
+    if prep_hits or "country_wide_missile_alert" in active or msg_density_10min >= 3:
+        triggers.extend(prep_hits)
+        if "country_wide_missile_alert" in active:
+            triggers.append("country_wide_missile_alert")
         if msg_density_10min >= 3:
             triggers.append(f"msg_density_10min={msg_density_10min}")
         return 2, triggers
@@ -370,12 +425,19 @@ def classify(
     combined, _hits = is_combined_attack(active)
 
     last_alarm: str | None = None
+    latest_official: str | None = None
     for m in sorted(messages, key=lambda m: m.ts, reverse=True):
-        if "kyiv_alarm_active" in m.tags and m.text:
+        if last_alarm is None and "kyiv_alarm_active" in m.tags and m.text:
             last_alarm = m.text[:160]
+        if latest_official is None and any(
+            t in m.tags for t in ("official_warning_attack", "presidential_statement_attack")
+        ) and m.text:
+            latest_official = m.text[:280]
+        if last_alarm and latest_official:
             break
 
     summary = make_summary(level, active, triggers, msg_density, last_alarm)
+    active_prep = frozenset(t for t in PREPARATION_TAGS if t in active)
     return ThreatState(
         level=level,
         level_name=LEVEL_NAMES[level],
@@ -386,6 +448,8 @@ def classify(
         summary=summary,
         computed_at=now,
         last_kyiv_alarm_text=last_alarm,
+        active_preparation_tags=active_prep,
+        latest_official_msg=latest_official,
     )
 
 

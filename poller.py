@@ -24,7 +24,7 @@ from typing import Callable
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
 
-from classifier import ThreatState, classify
+from classifier import TAG_LABELS, ThreatState, classify
 from config import Settings
 from db import DB
 from parser import (
@@ -91,26 +91,44 @@ async def _push_alert(
     settings: Settings,
     state: ThreatState,
     reason: str,
+    admin_only: bool = False,
+    icon: str = "🚨",
+    cooldown_override_sec: int | None = None,
 ) -> int:
-    """Push current state to all subscribers who qualify; return count delivered."""
+    """Push current state to subscribers who qualify; return count delivered.
+
+    Args:
+        admin_only: if True, deliver only to ADMIN_IDS (used for preparation
+            alerts that would confuse public subscribers).
+        icon: emoji prefix for the alert headline.
+        cooldown_override_sec: optional override of per-subscriber cooldown
+            (None = use settings.alert_cooldown_sec, 0 = no cooldown).
+    """
     now = _now_utc()
     delivered = 0
     subs = await asyncio.to_thread(db.list_subscribers)
+    cooldown = (
+        settings.alert_cooldown_sec if cooldown_override_sec is None
+        else cooldown_override_sec
+    )
     for sub in subs:
-        # admins always receive, regardless of muted/min_level settings
-        if not sub.is_admin and sub.user_id not in settings.admin_ids:
+        is_admin = sub.is_admin or sub.user_id in settings.admin_ids
+        if admin_only and not is_admin:
+            continue
+        if not is_admin:
             if sub.muted_until and sub.muted_until > now:
                 continue
             if state.level < sub.min_level:
                 continue
-            last = await asyncio.to_thread(db.last_alert_at, sub.user_id)
-            if last and (now - last).total_seconds() < settings.alert_cooldown_sec:
-                continue
+            if cooldown > 0:
+                last = await asyncio.to_thread(db.last_alert_at, sub.user_id)
+                if last and (now - last).total_seconds() < cooldown:
+                    continue
         text = (
-            f"🚨 <b>Загроза для Києва — {state.level_name}</b>\n"
+            f"{icon} <b>{state.level_name}</b>\n"
             f"<i>{reason}</i>\n\n"
             f"{state.summary}\n\n"
-            f"Снапшот: /status   Підписка: /subscribe   Пауза 1 год: /mute"
+            f"Деталі: /status"
         )
         try:
             await bot.send_message(sub.user_id, text, parse_mode="HTML", disable_web_page_preview=True)
@@ -186,6 +204,7 @@ async def poll_once(
     prev_combined_raw = await asyncio.to_thread(db.get_state, "last_combined")
     prev_combined = prev_combined_raw == "1"
 
+    # === Public-tier alerts (L3+) ===
     new_alert_needed = False
     reason = ""
 
@@ -204,6 +223,45 @@ async def poll_once(
         delivered = await _push_alert(bot, db, settings, state, reason)
         log.warning("Alert delivered to %d subscribers", delivered)
 
+    # === NEW: Preparation-tier alerts (admin-only, per-flag-onset) ===
+    # We track *which specific preparation flags were active last poll* in a
+    # comma-separated state row. A new push fires for any flag that newly
+    # appeared (off → on transition) — but only once per cycle of that flag,
+    # with a 6-hour re-arm so repeated takeoffs in the same window don't spam.
+    prev_prep_raw = await asyncio.to_thread(db.get_state, "active_prep_tags") or ""
+    prev_prep = set(t for t in prev_prep_raw.split(",") if t)
+    current_prep = set(state.active_preparation_tags)
+    new_prep_flags = current_prep - prev_prep
+    if new_prep_flags:
+        # Filter against per-flag rearm timestamps stored in DB
+        flags_to_alert: list[str] = []
+        for flag in new_prep_flags:
+            last_raw = await asyncio.to_thread(db.get_state, f"prep_last_alert_{flag}")
+            if last_raw:
+                try:
+                    last_ts = datetime.fromisoformat(last_raw)
+                    if (_now_utc() - last_ts).total_seconds() < 6 * 3600:
+                        continue
+                except ValueError:
+                    pass
+            flags_to_alert.append(flag)
+        if flags_to_alert:
+            labels = [TAG_LABELS.get(f, f) for f in flags_to_alert]
+            prep_reason = "🔵 Preparation: " + ", ".join(labels)
+            if state.latest_official_msg:
+                prep_reason += f"\n💬 {state.latest_official_msg[:200]}"
+            log.warning("PREP alert (admin): %s", prep_reason)
+            delivered = await _push_alert(
+                bot, db, settings, state, prep_reason,
+                admin_only=True, icon="🔵", cooldown_override_sec=0,
+            )
+            log.warning("Prep alert delivered to %d admins", delivered)
+            for flag in flags_to_alert:
+                await asyncio.to_thread(
+                    db.set_state, f"prep_last_alert_{flag}", _now_utc().isoformat(),
+                )
+
+    await asyncio.to_thread(db.set_state, "active_prep_tags", ",".join(sorted(current_prep)))
     await asyncio.to_thread(db.set_state, "last_level", str(state.level))
     await asyncio.to_thread(db.set_state, "last_combined", "1" if state.is_combined_attack else "0")
     await asyncio.to_thread(

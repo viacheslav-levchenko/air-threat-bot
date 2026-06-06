@@ -185,6 +185,73 @@ LEXICON: dict[str, list[str]] = {
         r"📡\s*обстановк",
         r"обстановка\s+станом\s+на",
     ],
+
+    # --- NEW: Official "intel" warning about upcoming/ongoing attack ---
+    # Triggered by official channels (operativnoZSU, kpszsu, Pravda_Gerashchenko)
+    # or analyst channels (ssternenko, serhii_flash) when an attack is being
+    # prepared and authorities WARN the public to take cover.
+    "official_warning_attack": [
+        r"за\s+даними\s+розвідк",
+        r"очіку[єє]ться\s+(масован|комбінован|повторн|ракетн)",
+        r"очіку[єє]м[оо]\s+(масован|комбінован|повторн|ракетн)",
+        r"висока\s+ймовірн\w*\s+(удар|атак)",
+        r"прогнозу[єє]ться\s+(масован|комбінован|удар|атак)",
+        r"попередж[еа]\w*\s+про\s+(можлив|ймовірн)\w*\s+(удар|атак)",
+        r"імовірн\w*\s+масован\w+\s+(удар|атак)",
+        r"будьте\s+уважн\w*.{0,30}(уноч|сьогодн|удар|атак|тривог)",
+        r"очіку[єй]те\s+(уноч|сьогодн|удар|тривог)",
+        r"можливі\s+(масован|комбінован)\w*\s+удар",
+        r"закликаю\s+мешканц\w*.{0,30}(укритт|тривог|удар)",
+    ],
+
+    # --- NEW: Presidential / leadership statement about attacks ---
+    "presidential_statement_attack": [
+        # @V_Zelenskiy_official tends to address the public after major strikes
+        r"російськ\w+\s+(удар|атак|тер[оо]р)",
+        r"масован\w+\s+ракетн\w+\s+атак",
+        r"чергов\w+\s+(удар|атак)\s+по\s+(укра[їі]н|київ|міст)",
+        r"шахед\w*.{0,30}(тер[оо]р|удар|атак)",
+    ],
+
+    # --- NEW: Tu-95/160 carrier movement (Engels, Olenya, etc.) ---
+    # Earlier-stage signal than the takeoff itself — preparation
+    "tu95_carrier_movement": [
+        r"ту-?(?:95|160|22)мс?.{0,30}(енгельс|оленья|оленья|діагонов|українк)",
+        r"енгельс.{0,20}(зліт|готовність|літак|борт)",
+        r"оленья.{0,20}(зліт|готовність|літак|борт)",
+        r"\bенгельс-?2?\b.{0,30}(актив|зліт)",
+    ],
+
+    # --- NEW: Iskander launch (more specific than generic ballistic_threat) ---
+    "iskander_launch": [
+        r"пуск\w*\s+іскандер",
+        r"іскандер\w*.{0,15}пуск",
+        r"\bб?р\b.{0,15}з\s+(брянщин|курськ|воронеж).{0,15}(пуск|відмічено)",
+    ],
+
+    # --- NEW: KAB threat in Kyiv region (rare but lethal) ---
+    "kab_kyiv": [
+        r"каб\w*.{0,30}(київ|київщин|вишгород|обухів|боярк)",
+        r"авіабомб\w*.{0,30}(київ|київщин)",
+    ],
+
+    # --- NEW: Strategic naval movement (ракетоносії з портів) ---
+    "naval_carrier_movement": [
+        r"ракетоносі[їі]\w*.{0,30}(вийшл|вивед[ееі]|у\s+мор)",
+        r"корабел\w*\s+ракетоносі",
+        r"чорноморськ\w+\s+флот.{0,30}(виход|актив|готовн)",
+        r"калібр.{0,15}на\s+борт",
+        r"носі[їі]\s+калібр\w*.{0,30}(вийшл|вивед|у\s+мор)",
+    ],
+
+    # --- NEW: Drone "swarms" launching from Russian territory ---
+    # Detected hours before they reach Kyiv — preparation signal
+    "shahed_launch_detected": [
+        r"пуск\w*\s+(?:бпла|шахед|геран)",
+        r"бпла.{0,20}з\s+(?:курськ|орловщин|брянщин|приморсько-ахтарськ)",
+        r"шахед\w*.{0,20}з\s+(?:приморсько-ахтарськ|орловщин|шаталове|курськ)",
+        r"масов\w+\s+пуск\w*\s+(?:бпла|шахед)",
+    ],
 }
 
 # Compile patterns once

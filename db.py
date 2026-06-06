@@ -54,6 +54,23 @@ SCHEMA_STATEMENTS = [
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )""",
+    # ---- Analytic-tier: incident-level "attacks on Kyiv" ----
+    # Populated by analytics.detect_incidents() from raw messages.
+    # Each incident = a coherent attack episode (clustered messages within
+    # 30 min that share weapon-type tags AND are Kyiv-directed).
+    """CREATE TABLE IF NOT EXISTS attacks_kyiv (
+        id          BIGSERIAL PRIMARY KEY,
+        attack_type TEXT NOT NULL,
+        started_at  TIMESTAMP NOT NULL,
+        ended_at    TIMESTAMP,
+        intensity   TEXT NOT NULL,
+        msg_count   INT NOT NULL DEFAULT 0,
+        sources     TEXT NOT NULL DEFAULT '[]',
+        first_msg_post TEXT,
+        notes       TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_attacks_kyiv_type_time ON attacks_kyiv(attack_type, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_attacks_kyiv_time ON attacks_kyiv(started_at DESC)",
 ]
 
 
@@ -124,9 +141,10 @@ class DB:
         return "%s" if self.is_pg else "?"
 
     def _adapt_sql(self, sql: str) -> str:
-        """Adapt the schema statement for Postgres-specific syntax differences."""
-        if self.is_pg:
-            sql = sql.replace("BOOLEAN NOT NULL DEFAULT FALSE", "BOOLEAN NOT NULL DEFAULT FALSE")
+        """Adapt schema statements for backend-specific syntax differences."""
+        if not self.is_pg:
+            # SQLite: BIGSERIAL → INTEGER PRIMARY KEY AUTOINCREMENT
+            sql = sql.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
         return sql
 
     def _init_schema(self) -> None:
@@ -320,6 +338,129 @@ class DB:
                 f"VALUES ({ph}, {ph}, {ph}, {ph})",
                 (user_id, level, summary, json.dumps(trigger_tags, ensure_ascii=False)),
             )
+
+    # ---------- attacks_kyiv (analytic-tier incidents) ----------
+
+    def insert_attack(
+        self,
+        attack_type: str,
+        started_at: datetime,
+        ended_at: datetime | None,
+        intensity: str,
+        msg_count: int,
+        sources: list[str],
+        first_msg_post: str | None,
+        notes: str | None = None,
+    ) -> None:
+        """Insert one detected attack incident. Idempotent on (type, started_at)."""
+        ph = self._ph()
+        # Skip if we already recorded an incident of this type that overlaps
+        with self.cursor() as cur:
+            check_sql = (
+                f"SELECT 1 FROM attacks_kyiv "
+                f"WHERE attack_type = {ph} AND ABS(strftime('%s', started_at) - strftime('%s', {ph})) < 1800"
+                if not self.is_pg
+                else
+                f"SELECT 1 FROM attacks_kyiv "
+                f"WHERE attack_type = {ph} AND ABS(EXTRACT(EPOCH FROM (started_at - {ph}::timestamp))) < 1800"
+            )
+            cur.execute(check_sql, (attack_type, started_at.replace(tzinfo=None) if self.is_pg else started_at.isoformat()))
+            if cur.fetchone():
+                return
+        ph = self._ph()
+        with self.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO attacks_kyiv "
+                f"(attack_type, started_at, ended_at, intensity, msg_count, sources, first_msg_post, notes) "
+                f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})",
+                (
+                    attack_type,
+                    started_at.replace(tzinfo=None) if self.is_pg else started_at.isoformat(),
+                    (ended_at.replace(tzinfo=None) if self.is_pg else ended_at.isoformat()) if ended_at else None,
+                    intensity,
+                    msg_count,
+                    json.dumps(sources, ensure_ascii=False),
+                    first_msg_post,
+                    notes,
+                ),
+            )
+
+    def attacks_in_range(self, since: datetime, until: datetime | None = None) -> list[dict]:
+        """Return all attack incidents between two timestamps (UTC, inclusive)."""
+        until = until or datetime.now(tz=timezone.utc)
+        ph = self._ph()
+        with self.cursor() as cur:
+            if self.is_pg:
+                cur.execute(
+                    f"SELECT id, attack_type, started_at, ended_at, intensity, msg_count, sources "
+                    f"FROM attacks_kyiv WHERE started_at >= {ph} AND started_at <= {ph} "
+                    f"ORDER BY started_at ASC",
+                    (since.replace(tzinfo=None), until.replace(tzinfo=None)),
+                )
+            else:
+                cur.execute(
+                    f"SELECT id, attack_type, started_at, ended_at, intensity, msg_count, sources "
+                    f"FROM attacks_kyiv WHERE datetime(started_at) >= datetime({ph}) "
+                    f"AND datetime(started_at) <= datetime({ph}) "
+                    f"ORDER BY started_at ASC",
+                    (since.isoformat(), until.isoformat()),
+                )
+            rows = cur.fetchall()
+        out: list[dict] = []
+        for r in rows:
+            try:
+                sources = json.loads(r[6]) if isinstance(r[6], str) else list(r[6] or [])
+            except (TypeError, json.JSONDecodeError):
+                sources = []
+            out.append({
+                "id": r[0],
+                "type": r[1],
+                "started_at": _to_dt(r[2]),
+                "ended_at": _to_dt(r[3]),
+                "intensity": r[4],
+                "msg_count": r[5],
+                "sources": sources,
+            })
+        return out
+
+    def last_attack_of_type(self, attack_type: str) -> dict | None:
+        """Most recent incident of a given type."""
+        ph = self._ph()
+        with self.cursor() as cur:
+            cur.execute(
+                f"SELECT attack_type, started_at, ended_at, intensity, msg_count "
+                f"FROM attacks_kyiv WHERE attack_type = {ph} "
+                f"ORDER BY started_at DESC LIMIT 1",
+                (attack_type,),
+            )
+            r = cur.fetchone()
+        if not r:
+            return None
+        return {
+            "type": r[0],
+            "started_at": _to_dt(r[1]),
+            "ended_at": _to_dt(r[2]),
+            "intensity": r[3],
+            "msg_count": r[4],
+        }
+
+    def count_attacks_by_type(self, since: datetime) -> dict[str, int]:
+        """Count attacks of each type since the given time."""
+        ph = self._ph()
+        with self.cursor() as cur:
+            if self.is_pg:
+                cur.execute(
+                    f"SELECT attack_type, COUNT(*) FROM attacks_kyiv "
+                    f"WHERE started_at >= {ph} GROUP BY attack_type",
+                    (since.replace(tzinfo=None),),
+                )
+            else:
+                cur.execute(
+                    f"SELECT attack_type, COUNT(*) FROM attacks_kyiv "
+                    f"WHERE datetime(started_at) >= datetime({ph}) GROUP BY attack_type",
+                    (since.isoformat(),),
+                )
+            return {r[0]: r[1] for r in cur.fetchall()}
 
     # ---------- generic key/value state ----------
 
