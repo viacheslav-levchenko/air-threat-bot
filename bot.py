@@ -341,8 +341,11 @@ async def cmd_history(message: Message, command: CommandObject) -> None:
     if not rows:
         await message.answer(f"За останні {hours} год нових повідомлень не зафіксовано.")
         return
+    await message.answer(await _format_history(rows, hours))
 
-    # Bucket per hour: count + max-severity tag
+
+async def _format_history(rows, hours: int) -> str:
+    """Bucket messages per hour, label with max-severity tag, append current state."""
     severity_order = [
         "ballistic_descent_kyiv", "explosions_kyiv", "ballistic_descent",
         "kyiv_alarm_ballistic", "cruise_missile_kyiv", "ballistic_threat_from_north",
@@ -361,7 +364,6 @@ async def cmd_history(message: Message, command: CommandObject) -> None:
                 break
         if "kyiv_alarm_active" in r.tags:
             b["kyiv_alarms"] += 1
-
     lines = [f"<b>📊 Таймлайн за {hours} год:</b>"]
     for key in sorted(buckets):
         b = buckets[key]
@@ -374,7 +376,7 @@ async def cmd_history(message: Message, command: CommandObject) -> None:
         )
     state = await get_state_async()
     lines.append(f"\n<b>Зараз:</b> {state.short_summary()}")
-    await message.answer("\n".join(lines))
+    return "\n".join(lines)
 
 
 @dp.message(Command("channels"))
@@ -395,45 +397,103 @@ async def cmd_channels(message: Message) -> None:
 
 @dp.callback_query(lambda cq: cq.data and cq.data.startswith("cmd:"))
 async def on_inline_button(cq: CallbackQuery) -> None:
-    """Re-dispatch inline button presses to the corresponding command handlers.
+    """Re-dispatch inline button presses by sending a fresh DM as the clicker.
 
     callback_data format:  cmd:<name>[:<arg>]
+
+    We can't mutate `cq.message.from_user` (frozen pydantic) and we can't pass
+    the bot's message to handlers that read from_user.id from it. Instead we
+    rebuild each action's behavior directly using `cq.from_user.id` and
+    `bot.send_message`.
     """
     await cq.answer()  # dismiss "loading" spinner
-    msg = cq.message
-    if not msg or not msg.chat:
+    if not cq.from_user:
         return
+    user_id = cq.from_user.id
+    username = cq.from_user.username
     parts = (cq.data or "").split(":", 2)
     name = parts[1] if len(parts) > 1 else ""
     arg = parts[2] if len(parts) > 2 else None
 
-    # Build a fake CommandObject for handlers that read .args
-    class _Cmd:
-        args = arg
+    try:
+        if name == "status":
+            state = await get_state_async()
+            text_parts = [state.summary]
+            if state.is_combined_attack:
+                text_parts.append("\n⚠️ <b>Зафіксовано ознаки комбінованої атаки</b>")
+            last_ts_raw = await asyncio.to_thread(db.get_state, "last_state_at")
+            if last_ts_raw:
+                try:
+                    last_ts = datetime.fromisoformat(last_ts_raw)
+                    text_parts.append(f"\n<i>Оновлено: {_fmt_local(last_ts)}</i>")
+                except ValueError:
+                    pass
+            await bot.send_message(
+                user_id, "\n".join(text_parts),
+                reply_markup=main_keyboard(), disable_web_page_preview=True,
+            )
 
-    # Fabricate a Message-like target so handlers can call .answer on it.
-    # We re-use the original DM chat.
-    target = msg
-    # Need to ensure from_user reflects the clicker, not the bot itself.
-    target.from_user = cq.from_user  # type: ignore[assignment]
+        elif name == "channels":
+            lines = ["<b>Джерела:</b>"]
+            for ch in settings.channels:
+                label = settings.channel_labels.get(ch, ch)
+                rows = await asyncio.to_thread(db.recent_messages_by_channel, ch, 1)
+                last = _fmt_local(rows[-1].ts) if rows else "—"
+                lines.append(f"• @{ch}  <i>{label}</i>  (остан. {last})")
+            await bot.send_message(user_id, "\n".join(lines), disable_web_page_preview=True)
 
-    handlers = {
-        "status": (cmd_status, False),
-        "history": (cmd_history, True),
-        "channels": (cmd_channels, False),
-        "subscribe": (cmd_subscribe, False),
-        "unsubscribe": (cmd_unsubscribe, False),
-        "mute": (cmd_mute, True),
-        "help": (cmd_help, False),
-    }
-    if name not in handlers:
-        await target.answer("Невідома кнопка.")
-        return
-    handler, takes_command = handlers[name]
-    if takes_command:
-        await handler(target, _Cmd())  # type: ignore[arg-type]
-    else:
-        await handler(target)
+        elif name == "history":
+            hours = 6
+            try:
+                if arg:
+                    hours = max(1, min(int(arg), 48))
+            except ValueError:
+                pass
+            rows = await asyncio.to_thread(db.recent_messages, hours * 60)
+            if not rows:
+                await bot.send_message(user_id, f"За останні {hours} год нових повідомлень не зафіксовано.")
+                return
+            await bot.send_message(user_id, await _format_history(rows, hours))
+
+        elif name == "subscribe":
+            await asyncio.to_thread(db.upsert_subscriber, user_id, username, is_admin(user_id))
+            await bot.send_message(
+                user_id,
+                f"✅ Підписано на сповіщення при рівні ≥ {settings.alert_min_level}. "
+                f"Пауза: натисни 🔇.",
+                reply_markup=main_keyboard(),
+            )
+
+        elif name == "unsubscribe":
+            await asyncio.to_thread(db.remove_subscriber, user_id)
+            await bot.send_message(user_id, "🔕 Відписано.")
+
+        elif name == "mute":
+            hours = 1.0
+            try:
+                if arg:
+                    hours = max(0.1, min(float(arg), 168))
+            except ValueError:
+                pass
+            until = _now_utc() + timedelta(hours=hours)
+            await asyncio.to_thread(db.upsert_subscriber, user_id, username, is_admin(user_id))
+            await asyncio.to_thread(db.mute_subscriber, user_id, until)
+            await bot.send_message(user_id, f"🔇 Сповіщення вимкнено до {_fmt_local(until)}.")
+
+        elif name == "help":
+            await bot.send_message(
+                user_id,
+                "📖 <b>Air-threat bot</b>\n\n"
+                "Парсю публічні Telegram-канали через web-mirror і будую rules-engine "
+                "стану загрози для Києва. Шкала 0-5: 🟢 Чисто → 💥 Удар.\n\n"
+                "Команди в меню (іконка ліворуч від поля вводу) або кнопки під цим повідомленням.",
+                reply_markup=main_keyboard(),
+            )
+
+        else:
+            await bot.send_message(user_id, "Невідома кнопка.")
+    except TelegramAPIError as e:
+        log.warning("Callback %r failed for user=%s: %s", name, user_id, e)
 
 
 @dp.message(Command("subs"))
