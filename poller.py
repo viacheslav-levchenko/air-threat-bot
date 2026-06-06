@@ -205,22 +205,42 @@ async def poll_once(
     prev_combined = prev_combined_raw == "1"
 
     # === Public-tier alerts (L3+) ===
+    # Notify on ANY upward level transition where the new level is >= 3.
+    # This means 2→3, 3→4, 4→5 each produce their own escalation alert
+    # (previously we only fired on the first threshold crossing). Transitions
+    # that END at level ≤ 2 are suppressed — level 2 has its own admin-only
+    # "preparation" push elsewhere; 1→2 and below would be noise.
     new_alert_needed = False
     reason = ""
+    cooldown_for_alert: int | None = None
+    alert_icon = "🚨"
 
-    if _level_crossed_threshold(prev_level, state.level, settings.alert_min_level):
+    level_went_up_to_3plus = (
+        state.level > prev_level and state.level >= settings.alert_min_level
+    )
+
+    if state.level >= 5 and prev_level < 5:
+        new_alert_needed = True
+        reason = "💥 УДАР — спуск балістики на Київ або вибухи в місті"
+        cooldown_for_alert = 0   # Impact alerts always fire, no cooldown
+        alert_icon = "💥"
+    elif level_went_up_to_3plus:
         new_alert_needed = True
         reason = f"Рівень загрози піднявся: {prev_level} → {state.level}"
+        # Use a short cooldown (2min) instead of the default 10min so
+        # 3→4→5 escalations within minutes each get their own alert.
+        cooldown_for_alert = 120
     elif state.is_combined_attack and not prev_combined:
         new_alert_needed = True
         reason = "Зафіксовано ознаки комбінованої атаки"
-    elif state.level >= 5 and prev_level < 5:
-        new_alert_needed = True
-        reason = "УДАР — підтверджені вибухи / спуск балістики на Київ"
 
     if new_alert_needed:
         log.warning("ALERT push (%s): %s", state.short_summary(), reason)
-        delivered = await _push_alert(bot, db, settings, state, reason)
+        delivered = await _push_alert(
+            bot, db, settings, state, reason,
+            icon=alert_icon,
+            cooldown_override_sec=cooldown_for_alert,
+        )
         log.warning("Alert delivered to %d subscribers", delivered)
 
     # === NEW: Preparation-tier alerts (admin-only, per-flag-onset) ===
