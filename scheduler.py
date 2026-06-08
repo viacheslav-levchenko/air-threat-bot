@@ -36,28 +36,48 @@ log = logging.getLogger("scheduler")
 
 DIGEST_HOUR_LOCAL = 9
 DIGEST_MINUTE_LOCAL = 0
+# Latest hour-of-day after which we will NOT catch-up a missed digest.
+# (E.g. if container restarts at 17:00 Kyiv, no point sending a "good morning"
+# briefing in the late afternoon — just wait until tomorrow.)
+DIGEST_CATCHUP_CUTOFF_HOUR = 14
+# Heartbeat interval — how often the loop wakes to check if a digest is due.
+# Short interval keeps us correct even after Render container restarts.
+DIGEST_LOOP_INTERVAL_SEC = 60
 
 
 def _now_utc() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
-def _next_digest_time(now: datetime, tz_name: str) -> datetime:
-    """Compute the next 09:00 Kyiv-time in UTC."""
+def _kyiv_now(tz_name: str) -> datetime:
+    """Local 'now' in the configured timezone (Europe/Kyiv by default)."""
     try:
         from zoneinfo import ZoneInfo
-        tz = ZoneInfo(tz_name)
+        return datetime.now(tz=ZoneInfo(tz_name))
     except Exception:  # noqa: BLE001
-        tz = timezone.utc
+        return datetime.now(tz=timezone.utc)
 
-    now_local = now.astimezone(tz)
-    target_local = now_local.replace(
+
+def _is_digest_due(tz_name: str, last_sent_key: str | None) -> tuple[bool, str]:
+    """True if we owe a digest for today (and haven't sent it yet).
+
+    Returns (due, today_key). "today" is in the configured local timezone.
+    """
+    now_local = _kyiv_now(tz_name)
+    today_key = now_local.date().isoformat()
+    if last_sent_key == today_key:
+        return False, today_key
+    target_today_local = now_local.replace(
         hour=DIGEST_HOUR_LOCAL, minute=DIGEST_MINUTE_LOCAL,
         second=0, microsecond=0,
     )
-    if target_local <= now_local:
-        target_local = target_local + timedelta(days=1)
-    return target_local.astimezone(timezone.utc)
+    if now_local < target_today_local:
+        # Today's 09:00 hasn't happened yet
+        return False, today_key
+    # Past today's 09:00, but cap how late we'll catch up
+    if now_local.hour >= DIGEST_CATCHUP_CUTOFF_HOUR:
+        return False, today_key
+    return True, today_key
 
 
 def build_digest(db: DB, settings: Settings, now: datetime | None = None) -> str:
@@ -172,28 +192,42 @@ async def _send_digest_to_all(bot: Bot, db: DB, settings: Settings) -> int:
 
 
 async def run_digest_scheduler(bot: Bot, db: DB, settings: Settings) -> None:
-    """Long-running task: sleep until 9:00 Kyiv, send digest, repeat."""
-    log.info("Digest scheduler started")
+    """Long-running task: every ~60s, check if a digest is due. If so, send.
+
+    This design is resilient to Render free-tier container restarts:
+      - A long `asyncio.sleep(17h)` would be killed by a container spin-down,
+        and on restart the scheduler would miss the 09:00 window entirely.
+      - Instead, we wake every minute, ask: "Is today's digest owed?". If
+        YES → send. If NO → sleep another minute.
+      - Catch-up: if container restarts at 11:00 with no digest sent today,
+        we send today's digest right now (capped at DIGEST_CATCHUP_CUTOFF_HOUR
+        so we don't send a "good morning" message in the evening).
+      - Idempotent: `last_digest_date` in DB prevents double-send.
+    """
+    log.info(
+        "Digest scheduler started — target %02d:%02d %s, catch-up until %02d:00, heartbeat %ds",
+        DIGEST_HOUR_LOCAL, DIGEST_MINUTE_LOCAL, settings.tz,
+        DIGEST_CATCHUP_CUTOFF_HOUR, DIGEST_LOOP_INTERVAL_SEC,
+    )
+    iteration = 0
     while True:
         try:
-            now = _now_utc()
-            next_run = _next_digest_time(now, settings.tz)
-            sleep_sec = max(1, (next_run - now).total_seconds())
-            log.info("Next digest at %s (sleeping %.0fs)", next_run.isoformat(), sleep_sec)
-            await asyncio.sleep(sleep_sec)
-
-            today_key = next_run.date().isoformat()
             last_sent = await asyncio.to_thread(db.get_state, "last_digest_date")
-            if last_sent == today_key:
-                log.info("Digest already sent today (%s), skipping", today_key)
-                # Small jitter so we don't busy-loop if scheduling drifts
-                await asyncio.sleep(60)
-                continue
-
-            log.warning("=== Sending 09:00 digest ===")
-            delivered = await _send_digest_to_all(bot, db, settings)
-            log.warning("Digest sent to %d subscribers", delivered)
-            await asyncio.to_thread(db.set_state, "last_digest_date", today_key)
+            due, today_key = _is_digest_due(settings.tz, last_sent)
+            iteration += 1
+            # Log every ~10 minutes for visibility without spamming
+            if iteration % 10 == 1:
+                now_local = _kyiv_now(settings.tz)
+                log.info(
+                    "Digest heartbeat: now=%s last_sent=%s due=%s",
+                    now_local.strftime("%Y-%m-%d %H:%M"), last_sent, due,
+                )
+            if due:
+                log.warning("=== Sending daily digest for %s ===", today_key)
+                delivered = await _send_digest_to_all(bot, db, settings)
+                log.warning("Digest sent to %d subscribers", delivered)
+                await asyncio.to_thread(db.set_state, "last_digest_date", today_key)
+            await asyncio.sleep(DIGEST_LOOP_INTERVAL_SEC)
         except asyncio.CancelledError:
             log.info("Digest scheduler cancelled")
             raise

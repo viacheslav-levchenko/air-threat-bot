@@ -407,11 +407,39 @@ async def cmd_forecast(message: Message) -> None:
 
 @dp.message(Command("digest"))
 async def cmd_digest(message: Message) -> None:
-    """Admin-only: preview the daily 9:00 digest right now."""
+    """Admin-only: preview the daily 9:00 digest right now (sends to self)."""
     if not in_dm(message) or not is_admin(message.from_user.id):
         return
     text = await asyncio.to_thread(build_digest, db, settings)
     await message.answer(text, disable_web_page_preview=True)
+
+
+@dp.message(Command("sendnow"))
+async def cmd_sendnow(message: Message) -> None:
+    """Admin-only: force-send today's daily digest to ALL subscribers.
+
+    Useful when the scheduler missed the 09:00 window (e.g. Render container
+    was spun down at that moment).
+    """
+    if not in_dm(message) or not is_admin(message.from_user.id):
+        return
+
+    # Import here to avoid a circular import at module load
+    from scheduler import _send_digest_to_all
+
+    await message.answer("⏳ Надсилаю сьогоднішній дайджест усім підписникам…")
+    delivered = await _send_digest_to_all(bot, db, settings)
+
+    # Mark today as sent so the scheduler doesn't double-send at 09:00 if
+    # an admin runs /sendnow in the morning before the scheduled time.
+    try:
+        from zoneinfo import ZoneInfo
+        today_key = datetime.now(tz=ZoneInfo(settings.tz)).date().isoformat()
+    except Exception:  # noqa: BLE001
+        today_key = datetime.now(tz=timezone.utc).date().isoformat()
+    await asyncio.to_thread(db.set_state, "last_digest_date", today_key)
+
+    await message.answer(f"✅ Доставлено {delivered} підписникам.")
 
 
 @dp.message(Command("channels"))
