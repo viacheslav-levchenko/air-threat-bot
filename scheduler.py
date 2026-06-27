@@ -37,9 +37,12 @@ log = logging.getLogger("scheduler")
 DIGEST_HOUR_LOCAL = 9
 DIGEST_MINUTE_LOCAL = 0
 # Latest hour-of-day after which we will NOT catch-up a missed digest.
-# (E.g. if container restarts at 17:00 Kyiv, no point sending a "good morning"
-# briefing in the late afternoon — just wait until tomorrow.)
-DIGEST_CATCHUP_CUTOFF_HOUR = 14
+# Raised to 20 in the no-keepalive regime: Render free tier without an
+# external ping spends most of the day cold. The container only wakes when
+# the user manually pings the bot (e.g. /forecast). If that happens at 18:00,
+# we still want to deliver today's brief — it's still actionable for the
+# night ahead. Past 20:00 we skip and wait for tomorrow.
+DIGEST_CATCHUP_CUTOFF_HOUR = 20
 # Heartbeat interval — how often the loop wakes to check if a digest is due.
 # Short interval keeps us correct even after Render container restarts.
 DIGEST_LOOP_INTERVAL_SEC = 60
@@ -81,7 +84,13 @@ def _is_digest_due(tz_name: str, last_sent_key: str | None) -> tuple[bool, str]:
 
 
 def build_digest(db: DB, settings: Settings, now: datetime | None = None) -> str:
-    """Build the 9:00 daily digest message (HTML-safe Telegram markup)."""
+    """Build the 9:00 daily digest message (HTML-safe Telegram markup).
+
+    Header adapts to current local time:
+      • 06:00-12:00 — "🌅 Доброго ранку"
+      • 12:00-17:00 — "☀️ Огляд за добу (catch-up)"  (container woke up late)
+      • 17:00-20:00 — "🌆 Вечірній огляд (catch-up)"  (last-chance delivery)
+    """
     now = now or _now_utc()
     yesterday = now - timedelta(hours=24)
 
@@ -116,8 +125,22 @@ def build_digest(db: DB, settings: Settings, now: datetime | None = None) -> str
 
     kyiv_alarm_count = sum(1 for m in pms_24h if "kyiv_alarm_active" in m.tags)
 
+    # Adapt header to actual delivery time (catch-up may arrive afternoon/evening)
+    try:
+        from zoneinfo import ZoneInfo
+        now_local = now.astimezone(ZoneInfo(settings.tz))
+    except Exception:  # noqa: BLE001
+        now_local = now
+    hour = now_local.hour
+    if hour < 12:
+        header = "🌅 <b>Доброго ранку.</b>"
+    elif hour < 17:
+        header = "☀️ <b>Огляд за добу (catch-up).</b>"
+    else:
+        header = "🌆 <b>Вечірній огляд за добу.</b>"
+
     lines: list[str] = []
-    lines.append("🌅 <b>Доброго ранку.</b>")
+    lines.append(header)
     lines.append("")
     lines.append("<b>За добу:</b>")
     if kyiv_alarm_count:
